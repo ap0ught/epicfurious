@@ -27,6 +27,7 @@ _TAG_ASSET_ATTRS: dict[str, list[str]] = {
 
 # Matches url(...) inside CSS, with or without quotes
 _CSS_URL_RE = re.compile(r"""url\(\s*['"]?([^)'"]+?)['"]?\s*\)""")
+_JS_QUOTED_URL_RE = re.compile(r'''["\']((?:\.\./|\./|/)?[A-Za-z0-9_\-./]+\.(?:js|mjs|cjs|json|png|jpe?g|gif|webp|svg|ico|bmp|mp3|ogg|wav|m4a|webm|mp4|woff2?|ttf|otf|wasm)(?:\?[^"\']*)?)["\']''')
 
 
 def _fetch(url: str) -> bytes:
@@ -50,6 +51,16 @@ def _url_to_asset(asset_url: str, base_url: str, output_dir: Path) -> tuple[str,
     path = parsed.path.lstrip("/")
     if not path or path.endswith("/"):
         path = (path or "") + "index.html"
+    if parsed.query:
+        safe_query = re.sub(r"[^A-Za-z0-9._-]+", "_", parsed.query).strip("_")
+        if safe_query:
+            p = Path(path)
+            suffix = p.suffix
+            stem = p.stem if suffix else p.name
+            parent = p.parent
+            query_part = f"__q_{safe_query}"
+            filename = f"{stem}{query_part}{suffix}" if suffix else f"{stem}{query_part}"
+            path = str(parent / filename) if str(parent) != "." else filename
     return path, output_dir / path, absolute
 
 
@@ -150,6 +161,30 @@ def _rewrite_css(css_text: str, css_url: str, output_dir: Path) -> tuple[str, li
     return _CSS_URL_RE.sub(_replace, css_text), assets
 
 
+def _extract_js_assets(
+    js_text: str,
+    js_url: str,
+    output_dir: Path,
+    context_base_url: str | None = None,
+) -> list[tuple[str, Path, str]]:
+    assets: list[tuple[str, Path, str]] = []
+    seen: set[str] = set()
+    preferred_base = context_base_url or js_url
+    for match in _JS_QUOTED_URL_RE.finditer(js_text):
+        candidate = match.group(1)
+        result = _url_to_asset(candidate, preferred_base, output_dir)
+        if result is None and preferred_base != js_url:
+            result = _url_to_asset(candidate, js_url, output_dir)
+        if result is None:
+            continue
+        rel, local, absolute = result
+        if absolute in seen:
+            continue
+        seen.add(absolute)
+        assets.append((rel, local, absolute))
+    return assets
+
+
 def download_site(url: str, output_dir: Path) -> None:
     """Download *url* and all referenced assets into *output_dir*."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -162,7 +197,7 @@ def download_site(url: str, output_dir: Path) -> None:
     index_html.write_text(rewriter.result(), encoding="utf-8")
     print(f"Saved HTML → {index_html}")
 
-    # 2. Download every collected asset (CSS files are also parsed for their own assets)
+    # 2. Download every collected asset (HTML and CSS files are parsed for nested assets)
     pending = list(rewriter.assets)
     seen: set[str] = {url}
 
@@ -180,10 +215,25 @@ def download_site(url: str, output_dir: Path) -> None:
 
         local.parent.mkdir(parents=True, exist_ok=True)
 
-        if local.suffix.lower() == ".css":
+        suffix = local.suffix.lower()
+        if suffix == ".css":
             css_text, css_assets = _rewrite_css(data.decode("utf-8", "replace"), absolute, output_dir)
             local.write_text(css_text, encoding="utf-8")
             pending.extend(a for a in css_assets if a[2] not in seen)
+        elif suffix in {".html", ".htm"}:
+            html_text = data.decode("utf-8", "replace")
+            page_rewriter = _HTMLRewriter(absolute, output_dir)
+            page_rewriter.feed(html_text)
+            local.write_text(page_rewriter.result(), encoding="utf-8")
+            pending.extend(a for a in page_rewriter.assets if a[2] not in seen)
+            page_js_assets = _extract_js_assets(html_text, absolute, output_dir, context_base_url=absolute)
+            pending.extend(a for a in page_js_assets if a[2] not in seen)
+        elif suffix in {".js", ".mjs", ".cjs"}:
+            js_text = data.decode("utf-8", "replace")
+            local.write_text(js_text, encoding="utf-8")
+            js_dir_base = absolute.rsplit("/", 1)[0] + "/"
+            js_assets = _extract_js_assets(js_text, absolute, output_dir, context_base_url=js_dir_base)
+            pending.extend(a for a in js_assets if a[2] not in seen)
         else:
             local.write_bytes(data)
 
