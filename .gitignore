@@ -1,2 +1,5 @@
 __pycache__/
 *.py[cod]
+
+# Generated mirror – built by the GitHub Actions workflow, not committed
+docs/
